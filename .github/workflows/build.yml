@@ -1,0 +1,112 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract project from zip
+        run: |
+          python3 - << 'PY'
+          import glob, os, shutil, sys, zipfile
+
+          zips = sorted(p for p in glob.glob('**/*.zip', recursive=True) if not p.startswith('.git'))
+          print('Zip files in repo:', zips)
+          if not zips:
+              print('::error::Repo mein koi zip file nahi hai. Pehle zip upload karein.')
+              sys.exit(1)
+          zp = zips[0]
+          print('Using:', zp, os.path.getsize(zp), 'bytes')
+
+          shutil.rmtree('_x', ignore_errors=True)
+          z = zipfile.ZipFile(zp)
+          for info in z.infolist():
+              name = info.filename.replace('\\', '/')
+              parts = [p for p in name.split('/') if p not in ('', '.')]
+              if not parts or '..' in parts:
+                  continue
+              dest = os.path.join('_x', *parts)
+              if name.endswith('/') or info.is_dir():
+                  os.makedirs(dest, exist_ok=True)
+                  continue
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              with z.open(info) as s, open(dest, 'wb') as d:
+                  shutil.copyfileobj(s, d)
+
+          best = None
+          for root, dirs, files in os.walk('_x'):
+              if 'settings.gradle' in files and os.path.isdir(os.path.join(root, 'app')):
+                  if best is None or len(root) < len(best):
+                      best = root
+          if best is None:
+              print('::error::Zip ke andar settings.gradle + app folder nahi mila. Galat zip hai.')
+              for root, dirs, files in os.walk('_x'):
+                  print(root, files[:10])
+              sys.exit(1)
+
+          shutil.rmtree('build_proj', ignore_errors=True)
+          shutil.copytree(best, 'build_proj')
+          print('Project folder:', best)
+          PY
+          echo "== build_proj =="
+          ls -la build_proj
+          ls -la build_proj/app
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Get Xposed API jar
+        run: |
+          cd build_proj
+          mkdir -p app/libs
+          for url in \
+            "https://github.com/rovo89/XposedBridge/releases/download/v82/api-82.jar" \
+            "https://api.xposed.info/de/robv/android/xposed/api/82/api-82.jar" \
+            "https://jitpack.io/com/github/rovo89/XposedBridge/82/XposedBridge-82.jar"
+          do
+            echo "Trying $url"
+            if curl -fsSL "$url" -o app/libs/api-82.jar && unzip -tq app/libs/api-82.jar >/dev/null 2>&1; then
+              echo "Downloaded OK"; break
+            fi
+            rm -f app/libs/api-82.jar
+          done
+          test -s app/libs/api-82.jar || { echo "::error::Could not download Xposed API jar"; exit 1; }
+
+      - name: Point Gradle at the local jar
+        run: |
+          cd build_proj
+          sed -i "s#compileOnly 'de.robv.android.xposed:api:82'#compileOnly files('libs/api-82.jar')#" app/build.gradle
+          sed -i "/api.xposed.info/d" settings.gradle
+          tail -5 app/build.gradle
+
+      - name: Build debug APK
+        run: |
+          cd build_proj
+          gradle assembleDebug --no-daemon --console=plain 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
+
+      - name: Show real error
+        if: failure()
+        run: |
+          {
+            echo '### Build error'
+            echo '```'
+            grep -nE -A8 "What went wrong|error:|Could not|FAILURE" build_proj/build.log | head -60
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DynamicPill-apk
+          path: build_proj/app/build/outputs/apk/debug/*.apk
